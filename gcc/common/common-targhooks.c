@@ -90,3 +90,18 @@ const struct default_options empty_optimization_table[] =
   {
     { OPT_LEVELS_NONE, 0, NULL, 0 }
   };
+
+/* Default version of TARGET_COMPUTE_MULTILIB.  */
+const char *
+default_compute_multilib(
+  const struct switchstr *switches,
+  int n_switches,
+  const char *multilib,
+  const char *multilib_select,
+  const char *multilib_matches,
+  const char *multilib_defaults,
+  const char *multilib_exclusions,
+  const char *multilib_reuse)
+{
+  return multilib;
+}

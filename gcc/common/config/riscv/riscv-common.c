@@ -30,6 +30,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "flags.h"
 #include "diagnostic-core.h"
 #include "config/riscv/riscv-protos.h"
+#include <vector>
 
 #define RISCV_DONT_CARE_VERSION -1
 
@@ -171,6 +172,7 @@ public:
 
   static riscv_subset_list *parse (const char *, location_t);
 
+  int match_score (riscv_subset_list *) const;
 };
 
 static const char *riscv_supported_std_ext (void);
@@ -200,6 +202,19 @@ riscv_subset_list::~riscv_subset_list ()
       delete item;
       item = next;
     }
+}
+
+int
+riscv_subset_list::match_score(riscv_subset_list *list) const
+{
+  riscv_subset_t *s;
+  int score = 0;
+
+  for (s = m_head; s != NULL; s = s->next)
+    if (list->lookup (s->name.c_str ()) != NULL)
+      score++;
+
+  return score;
 }
 
 /* Get the rank for single-letter subsets, lower value meaning higher
@@ -1123,5 +1138,279 @@ static const struct default_options riscv_option_optimization_table[] =
 
 #undef TARGET_HANDLE_OPTION
 #define TARGET_HANDLE_OPTION riscv_handle_option
+
+static const char *find_last(const struct switchstr *switches, int n_switches, const char *prefix)
+{
+  int i;
+  size_t len = strlen (prefix);
+  for (i = 0; i < n_switches; ++i) {
+    const struct switchstr *this_switch = &switches[n_switches - i - 1];
+
+    if (this_switch->live_cond & SWITCH_FALSE)
+      continue;
+
+    if (strncmp (this_switch->part1, prefix, len) == 0)
+      return this_switch->part1 + len;
+  }
+  return NULL;
+}
+
+struct multi_lib_info_t {
+  std::string path;
+  std::string cond;
+  std::string arch_str;
+  std::string abi_str;
+  riscv_subset_list *subset_list;
+  enum riscv_abi_type abi;
+  bool valid;
+
+  static bool parse (struct multi_lib_info_t *,
+		     const std::string &,
+		     const std::string &,
+		     const char *);
+};
+
+
+bool
+multi_lib_info_t::parse (
+  struct multi_lib_info_t *multi_lib_info,
+  const std::string &path,
+  const std::string &cond,
+  const char *multilib_defaults)
+{
+  enum riscv_abi_type abi;
+  if (path == ".")
+    {
+      multi_lib_info->arch_str = STRINGIZING (TARGET_RISCV_DEFAULT_ARCH);
+      multi_lib_info->abi_str = STRINGIZING (TARGET_RISCV_DEFAULT_ABI);
+      multi_lib_info->subset_list =
+	riscv_subset_list::parse(
+	  STRINGIZING (TARGET_RISCV_DEFAULT_ARCH),
+	  input_location);
+    }
+  else
+    {
+      size_t slash_pos = path.find('/');
+
+      if (slash_pos == std::string::npos)
+	return false;
+
+      multi_lib_info->arch_str = path.substr(0, slash_pos);
+      multi_lib_info->abi_str = path.substr(slash_pos + 1, path.length() - 1);
+   }
+  const std::string &abi_str = multi_lib_info->abi_str;
+
+  multi_lib_info->valid = true;
+  multi_lib_info->subset_list =
+    riscv_subset_list::parse(multi_lib_info->arch_str.c_str (), input_location);
+
+  if (abi_str == "ilp32")
+    abi = ABI_ILP32;
+  else if (abi_str == "ilp32f")
+    abi = ABI_ILP32F;
+  else if (abi_str == "ilp32d")
+    abi = ABI_ILP32D;
+  else if (abi_str == "ilp32e")
+    abi = ABI_ILP32E;
+  else if (abi_str == "lp64")
+    abi = ABI_LP64;
+  else if (abi_str == "lp64f")
+    abi = ABI_LP64F;
+  else if (abi_str == "lp64d")
+    abi = ABI_LP64D;
+  else
+    gcc_unreachable ();
+
+  multi_lib_info->abi = abi;
+  return true;
+}
+
+/* Implement TARGET_COMPUTE_MULTILIB.  */
+
+#define DEBUG 0
+
+const char *
+riscv_compute_multilib(
+  const struct switchstr *switches,
+  int n_switches,
+  const char *multilib,
+  const char *multilib_select,
+  const char *multilib_matches,
+  const char *multilib_defaults,
+  const char *multilib_exclusions,
+  const char *multilib_reuse)
+{
+  const char *p;
+  const char *arch_str = NULL;
+  const char *abi_str = NULL;
+  const char *this_path, *this_option_set;
+  size_t this_path_len, this_option_set_len;
+  bool result;
+  bool has_c;
+  bool has_a;
+  bool has_m;
+  riscv_subset_list *subset_list = NULL;
+
+  std::vector<multi_lib_info_t> multilib_infos;
+  multi_lib_info_t multilib_info;
+
+  /* Find last march.  */
+  arch_str = find_last (switches, n_switches, "march=");
+  subset_list = riscv_subset_list::parse(arch_str, input_location);
+
+  if (subset_list == NULL)
+    return multilib;
+
+  has_c = subset_list->lookup("c");
+  has_a = subset_list->lookup("a");
+  has_m = subset_list->lookup("m");
+
+  /* Find mabi.  */
+  abi_str = find_last (switches, n_switches, "mabi=");
+
+  /* Parsing MULTILIB_SELECT.
+     TODO: most codes are garb from gcc.c, maybe we should refine that?  */
+  p = multilib_select;
+
+  while (*p != '\0')
+    {
+      /* Ignore newlines.  */
+      if (*p == '\n')
+	{
+	  ++p;
+	  continue;
+	}
+
+      /* Get the initial path.  */
+      this_path = p;
+      while (*p != ' ')
+	{
+	  if (*p == '\0')
+	    {
+	      fatal_error (input_location, "multilib select %qs %qs is invalid",
+			   multilib_select, multilib_reuse);
+	    }
+	  ++p;
+	}
+      this_path_len = p - this_path;
+      multilib_info.path = std::string (this_path, this_path_len);
+
+      this_option_set = p;
+      while (*p != ';')
+	{
+	  if (*p == '\0')
+	    {
+	      fatal_error (input_location, "multilib select %qs %qs is invalid",
+			   multilib_select, multilib_reuse);
+	    }
+	  ++p;
+	}
+
+      this_option_set_len = p - this_option_set;
+
+      result = multi_lib_info_t::parse(&multilib_info,
+	      std::string (this_path, this_path_len),
+	      std::string (this_option_set, this_option_set_len),
+	      multilib_defaults);
+
+      if (result)
+	multilib_infos.push_back (multilib_info);
+
+      p++;
+    }
+
+  int match_score = 0;
+  int max_match_score = 0;
+  int best_match_multi_lib = -1;
+  /* Parsing multi-lib rule done.  */
+  /* Try to decition which set we should used.  */
+  /* We have 4 level dection tree here, ABI, C-ext, M-ext, A-ext.  */
+  for (size_t i = 0; i < multilib_infos.size (); ++i)
+    {
+      bool valid;
+      bool multi_lib_has_a;
+      bool multi_lib_has_c;
+      bool multi_lib_has_m;
+#if DEBUG
+      printf ("try %s %s %s\n",
+	      multilib_infos[i].path.c_str (),
+	      multilib_infos[i].cond.c_str(),
+	      multilib_infos[i].subset_list->to_string(false).c_str());
+#endif
+      /* Filter out incompatible ABI first.  */
+      if (abi_str != multilib_infos[i].abi_str)
+	{
+	  multilib_infos[i].valid = false;
+#if DEBUG
+	  printf("ABI match failed\n");
+#endif
+	  continue;
+	}
+
+      /* There is different code gen in libstdc++ and libatomic when w/ A-ext
+	 and w/o A-ext, so they are incompatible.  */
+      multi_lib_has_a = multilib_infos[i].subset_list->lookup("a") != NULL;
+      if (has_a != multi_lib_has_a)
+	{
+	  multilib_infos[i].valid = false;
+#if DEBUG
+	  printf("A-ext match failed\n");
+#endif
+	  continue;
+	}
+
+      /* We don't care if library has C-ext or not if we have C-ext,
+	 but if we don't have C-ext, we must link with libraries without
+	 C-ext.  */
+      multi_lib_has_c = multilib_infos[i].subset_list->lookup("c") != NULL;
+      if (!has_c && multi_lib_has_c)
+	{
+	  multilib_infos[i].valid = false;
+#if DEBUG
+	  printf("C-ext match failed\n");
+#endif
+	  continue;
+	}
+
+      /* We don't care if library has M-ext or not if we have M-ext,
+	 but if we don't have M-ext, we must link with libraries without
+	 M-ext, because we'll need soft mul/div routines in libgcc, they are not
+	 provided if M-ext is enabled in the multi-lib setting.  */
+      multi_lib_has_m = multilib_infos[i].subset_list->lookup("m") != NULL;
+      if (!has_m && multi_lib_has_m)
+	{
+	  multilib_infos[i].valid = false;
+#if DEBUG
+	  printf("M-ext match failed\n");
+#endif
+	  continue;
+	}
+
+      /* Found a compatible multi-lib setting! Calculate the match score.  */
+      match_score = subset_list->match_score(multilib_infos[i].subset_list);
+
+      /* Record highest match score multi-lib setting.  */
+      if (match_score > max_match_score)
+	best_match_multi_lib = i;
+
+#if DEBUG
+      printf ("score = %d %s %s\n", match_score, multilib_infos[i].path.c_str (), multilib_infos[i].cond.c_str());
+#endif
+    }
+
+  if (best_match_multi_lib == -1)
+    {
+      fatal_error (
+	input_location,
+	"Can't found suitable multilib set for %<-march=%s%>/%<-mabi=%s%>",
+	arch_str, abi_str);
+      return multilib;
+    }
+  else
+    return xstrdup (multilib_infos[best_match_multi_lib].path.c_str ());
+}
+
+#undef TARGET_COMPUTE_MULTILIB
+#define TARGET_COMPUTE_MULTILIB riscv_compute_multilib
 
 struct gcc_targetm_common targetm_common = TARGETM_COMMON_INITIALIZER;
